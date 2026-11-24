@@ -2,15 +2,219 @@ import { GoogleGenAI } from "@google/genai";
 
 const ai = new GoogleGenAI({ apiKey: import.meta.env.VITE_API_KEY });
 
-const MODELS = [
+/* ------------------------------------------------------------------ */
+/*  Robust model handling                                              */
+/*  - Models are discovered automatically from Google's live list,     */
+/*    so retired / renamed models never break the app.                 */
+/*  - Retired models (404) are skipped permanently for the session.    */
+/*  - Busy models (503 / 429 / timeouts) are retried with backoff.     */
+/*  - The last working model is tried first next time.                 */
+/* ------------------------------------------------------------------ */
+
+// Used only if the live model list cannot be fetched.
+const FALLBACK_MODELS = [
   "gemini-3.6-flash",
   "gemini-3.5-flash",
   "gemini-3.5-flash-lite",
   "gemini-3.1-flash-lite",
   "gemini-3.7-flash",
+  "gemini-3.8-flash",
 ];
 
+const EXCLUDE =
+  /image|tts|live|audio|embed|robotics|transcribe|translate|omni|veo|lyria|imagen|aqa|vision|computer-use|customtools/i;
+
+const MAX_ROUNDS = 3;
+const REQUEST_TIMEOUT_MS = 60000;
+const MAX_DISCOVERED = 8;
+
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+
+const withTimeout = (promise, ms) =>
+  Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("Request timed out")), ms),
+    ),
+  ]);
+
+let modelsPromise = null;
+let preferredModel = null;
+const deadModels = new Set();
+
+function rankModel(name) {
+  const id = name.replace("models/", "");
+  const versionMatch = id.match(/gemini-(\d+(?:\.\d+)?)/);
+  const version = versionMatch ? parseFloat(versionMatch[1]) : 0;
+
+  let tier = 0;
+  if (/preview|exp/.test(id)) tier += 10;
+  if (/pro/.test(id)) tier += 5;
+  if (/latest/.test(id)) tier += 3;
+  if (/lite/.test(id)) tier += 1;
+
+  return { tier, version };
+}
+
+async function discoverModels() {
+  const found = [];
+  try {
+    const pager = await withTimeout(ai.models.list(), 15000);
+    for await (const m of pager) {
+      const name = m?.name || "";
+      if (!name.startsWith("models/gemini")) continue;
+      if (EXCLUDE.test(name)) continue;
+      const actions = m.supportedActions || m.supportedGenerationMethods;
+      if (Array.isArray(actions) && !actions.includes("generateContent")) {
+        continue;
+      }
+      found.push(name.replace("models/", ""));
+    }
+  } catch (err) {
+    console.warn(
+      "Could not fetch model list, using fallback:",
+      String(err?.message || err).slice(0, 120),
+    );
+  }
+
+  found.sort((a, b) => {
+    const ra = rankModel(a);
+    const rb = rankModel(b);
+    if (ra.tier !== rb.tier) return ra.tier - rb.tier;
+    return rb.version - ra.version;
+  });
+
+  const merged = [...found.slice(0, MAX_DISCOVERED)];
+  for (const m of FALLBACK_MODELS) {
+    if (!merged.includes(m)) merged.push(m);
+  }
+  return merged;
+}
+
+function getModels() {
+  if (!modelsPromise) modelsPromise = discoverModels();
+  return modelsPromise;
+}
+
+function errorInfo(err) {
+  const msg = String(err?.message || err);
+  let code = Number(err?.status || err?.code) || 0;
+  try {
+    const json = JSON.parse(msg.slice(msg.indexOf("{")));
+    code = Number(json?.error?.code) || code;
+  } catch {
+    // message is not JSON, ignore
+  }
+  return { code, msg };
+}
+
+function cleanJson(text) {
+  let t = text.trim();
+  t = t
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/, "")
+    .trim();
+  try {
+    JSON.parse(t);
+    return t;
+  } catch {
+    const start = t.indexOf("{");
+    const end = t.lastIndexOf("}");
+    if (start !== -1 && end > start) {
+      const sliced = t.slice(start, end + 1);
+      try {
+        JSON.parse(sliced);
+        return sliced;
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+}
+
+async function generate(prompt, label, json = false) {
+  let lastError;
+
+  for (let round = 0; round < MAX_ROUNDS; round++) {
+    const allModels = await getModels();
+    let candidates = allModels.filter((m) => !deadModels.has(m));
+
+    // Everything was marked dead: refresh the list and start clean.
+    if (candidates.length === 0) {
+      deadModels.clear();
+      modelsPromise = null;
+      candidates = await getModels();
+    }
+
+    // Try the last working model first.
+    if (preferredModel && candidates.includes(preferredModel)) {
+      candidates = [
+        preferredModel,
+        ...candidates.filter((m) => m !== preferredModel),
+      ];
+    }
+
+    for (const model of candidates) {
+      try {
+        const response = await withTimeout(
+          ai.models.generateContent({
+            model,
+            contents: prompt,
+            ...(json
+              ? { config: { responseMimeType: "application/json" } }
+              : {}),
+          }),
+          REQUEST_TIMEOUT_MS,
+        );
+
+        let text = response.text;
+        if (!text || !text.trim()) continue;
+
+        if (json) {
+          text = cleanJson(text);
+          if (text === null) continue; // invalid JSON, try next model
+        }
+
+        preferredModel = model;
+        console.log("Used model" + label + ":", model);
+        return text;
+      } catch (err) {
+        lastError = err;
+        const { code, msg } = errorInfo(err);
+
+        // Wrong / invalid API key: no point trying other models.
+        if (/API_KEY_INVALID|API key not valid|API key expired/i.test(msg)) {
+          throw new Error(
+            "Invalid API key. Please check VITE_API_KEY in your environment settings.",
+          );
+        }
+
+        // Retired or unknown model: never try it again this session.
+        if (
+          code === 404 ||
+          /no longer available|not found|not supported/i.test(msg)
+        ) {
+          deadModels.add(model);
+        }
+
+        console.warn("Model failed:", model, msg.slice(0, 120));
+      }
+    }
+
+    // Wait a bit before the next round (2s, 4s, 8s).
+    if (round < MAX_ROUNDS - 1) await sleep(2000 * 2 ** round);
+  }
+
+  console.error("All models failed:", lastError);
+  throw new Error(
+    "The AI service is busy right now. Please try again in a minute.",
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  Prompts (unchanged)                                                */
+/* ------------------------------------------------------------------ */
 
 const SYSTEM_PROMPT_ANALYZE = `
 You are an expert Senior Software Engineer, Security Auditor, and Code Reviewer.
@@ -109,6 +313,10 @@ IMPORTANT RULES:
 6. If the code has no problems, return it unchanged.
 `;
 
+/* ------------------------------------------------------------------ */
+/*  Public API (same names and signatures as before)                   */
+/* ------------------------------------------------------------------ */
+
 export async function main(code, language) {
   const finalPrompt =
     SYSTEM_PROMPT_ANALYZE +
@@ -117,35 +325,7 @@ export async function main(code, language) {
     "\n\nCode to review:\n" +
     code;
 
-  let lastError;
-
-  // Try the full model list for up to 2 rounds
-  for (let round = 0; round < 2; round++) {
-    for (const model of MODELS) {
-      try {
-        const response = await ai.models.generateContent({
-          model,
-          contents: finalPrompt,
-          config: { responseMimeType: "application/json" },
-        });
-        const text = response.text;
-        if (text && text.trim()) {
-          console.log("Used model:", model);
-          return text;
-        }
-      } catch (err) {
-        lastError = err;
-        console.warn(
-          "Model failed:",
-          model,
-          String(err?.message || err).slice(0, 120),
-        );
-      }
-    }
-    await sleep(2000);
-  }
-
-  throw lastError;
+  return generate(finalPrompt, "", true);
 }
 
 export async function explain(code, language) {
@@ -156,34 +336,7 @@ export async function explain(code, language) {
     "\n\nCode to explain:\n" +
     code;
 
-  let lastError;
-
-  // Same fallback logic as main(), without JSON mode (Markdown output)
-  for (let round = 0; round < 2; round++) {
-    for (const model of MODELS) {
-      try {
-        const response = await ai.models.generateContent({
-          model,
-          contents: finalPrompt,
-        });
-        const text = response.text;
-        if (text && text.trim()) {
-          console.log("Used model (explain):", model);
-          return text;
-        }
-      } catch (err) {
-        lastError = err;
-        console.warn(
-          "Model failed:",
-          model,
-          String(err?.message || err).slice(0, 120),
-        );
-      }
-    }
-    await sleep(2000);
-  }
-
-  throw lastError;
+  return generate(finalPrompt, " (explain)");
 }
 
 export async function fix(code, language) {
@@ -194,31 +347,5 @@ export async function fix(code, language) {
     "\n\nCode to fix:\n" +
     code;
 
-  let lastError;
-
-  for (let round = 0; round < 2; round++) {
-    for (const model of MODELS) {
-      try {
-        const response = await ai.models.generateContent({
-          model,
-          contents: finalPrompt,
-        });
-        const text = response.text;
-        if (text && text.trim()) {
-          console.log("Used model (fix):", model);
-          return text;
-        }
-      } catch (err) {
-        lastError = err;
-        console.warn(
-          "Model failed:",
-          model,
-          String(err?.message || err).slice(0, 120),
-        );
-      }
-    }
-    await sleep(2000);
-  }
-
-  throw lastError;
+  return generate(finalPrompt, " (fix)");
 }
